@@ -1,0 +1,92 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Nov 18 11:35:34 2020
+
+@author: liyiling
+"""
+
+#%%
+from futu import *
+import pandas as pd
+import time
+import numpy as np
+from scipy.stats import norm
+N = norm.cdf
+#%% 获取股票实时报价==》抓住波动过大的情况==》查询对应期权
+quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
+stock_chain = ['US.KNDI']
+
+#cur_history = pd.DataFrame(columns = ["cur_price"])
+
+ret_sub, err_message = quote_ctx.subscribe(stock_chain, [SubType.RT_DATA], subscribe_push=False)
+if ret_sub == RET_OK:   # 订阅成功
+    ret, data = quote_ctx.get_rt_data(stock_chain[0])   # 获取一次分时数据
+    if ret == RET_OK:
+        stock_data=data
+        stock_data["log_ret"] = np.log(stock_data["cur_price"]/stock_data["cur_price"].shift(1))
+        stock_data['vol'] = stock_data['log_ret'].rolling(window=252).std() * np.sqrt(252)
+        ## 计算一次波动率
+        if stock_data.loc[-1,"cur_price"]/stock_data.loc[-10,"cur_price"]>0.08:
+            print("=========== option sign at stock price %d=============",%(stock_data.loc[-1,"cur_price"]))
+            target_option = find_option(stock_chain[0],stock_data.loc[-1,"cur_price"],vol)
+            
+        
+    else:
+        print('error:', data)
+else:
+    print('subscription failed', err_message)
+
+#%%获取末日期权名字===》选取隐含波动率高的、out of money 卖出
+find_option(stock_ticker,stock_price,vol):##input one stock ticker,get option chain
+    ret, data = quote_ctx.get_option_chain(stock_ticker, IndexOptionType.SMALL, '2020-11-08', '2020-12-20', OptionType.CALL, OptionCondType.WITHIN)
+    if ret == RET_OK:
+        derivatives = data["code"]
+    else:
+        print('error:', data)
+    quote_ctx.close() # 结束后记得关闭当条连接，防止连接条数用尽
+    
+    ret_sub, err_message = quote_ctx.subscribe(derivatives, [SubType.QUOTE], subscribe_push=False)
+    # 先订阅k线类型。订阅成功后OpenD将持续收到服务器的推送，False代表暂时不需要推送给脚本
+    if ret_sub == RET_OK:  # 订阅成功
+        ret, data = quote_ctx.get_stock_quote(derivatives)  # 获取订阅期权链所有信息
+        if ret == RET_OK:
+            option_info = data
+            #option_info = option_info[option_info["strike_price"]>stock price]
+            option_info["bs_vega"] = bs_vega(stock_price, option_info["strike_price"], option_info["expiry_date_distance"], 0.02, vol)
+            
+            option_info["implied_vol"] = find_vol(stock_price, option_info["strike_price"], option_info["expiry_date_distance"], 0.02)
+
+#print ('Implied vol: %.2f%%' % (implied_vol * 100))
+#print ('Market price = %.2f' % V_market)
+#print ('Model price = %.2f' % bs_call(S, K, T, r, implied_vol))
+        else:
+            print('error:', data)
+    else:
+        print('subscription failed', err_message)
+    quote_ctx.close()  # 关闭当条连接，OpenD会在1分钟后自动取消相应股票相应类型的订阅
+    
+    return option_ticker
+
+#%% 计算隐含波动率
+#def bs_call(S, K, T, r, vol):
+#    d1 = (np.log(S/K) + (r + 0.5*vol**2)*T) / (vol*np.sqrt(T))
+#    d2 = d1 - vol * np.sqrt(T)
+#    return S * norm.cdf(d1) - np.exp(-r * T) * K * norm.cdf(d2)
+
+def bs_vega(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    return S * norm.pdf(d1) * np.sqrt(T)
+
+def find_vol(target_value, S, K, T, r, *args):
+    MAX_ITERATIONS = 200
+    PRECISION = 1.0e-5
+    sigma = 0.5
+    for i in range(0, MAX_ITERATIONS):
+        price = bs_call(S, K, T, r, sigma)
+        vega = bs_vega(S, K, T, r, sigma)
+        diff = target_value - price  # our root
+        if (abs(diff) < PRECISION):
+            return sigma
+        sigma = sigma + diff/vega # f(x) / f'(x)
+    return sigma # value wasn't found, return best guess so far
+
